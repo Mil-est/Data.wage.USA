@@ -1,0 +1,231 @@
+---
+title: "Lasso"
+author: "Milagros Mellizo"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+```{r}
+library('tidyverse')
+
+```
+
+## Data Analysis
+Import the data set. Make sure the column names are imported as intended.
+
+```{r}
+data <- read_csv('wage2015_subsample_inference.csv')
+data
+```
+
+Separate the features and the target variable
+```{r}
+X <- data[, !(names(data) %in% c('wage', 'lwage'))]  # Drop columns 'wage' and 'lwage'
+y <- data['lwage']
+```
+
+Create the design matrix
+```{r}
+library(stats)
+
+X_flexible <- model.matrix(~ 0 + sex + (exp1 + exp2 + exp3 + exp4 + hsg + scl + clg + ad + so + we + ne + factor(occ2) + factor(ind2))^2, data = X)
+```
+
+```{r}
+y <- as.matrix(y)
+
+X_flexible <- as.matrix(X_flexible)
+```
+
+## Creating the Lasso Cross-Validation Procedure
+
+
+### The `log_grid` function is pretty straight forward
+
+```{r}
+log_grid <- function(lower, upper, log_step) {
+  log_grid <- seq(lower, upper, length.out = 1 / log_step)
+  return(exp(log_grid))
+}
+```
+
+###  the `k_folds` function
+
+Note: there are many different approaches. We exploited the kronecker product operation and block matrices to build the $k$-folds. Also, we addressed the issue of divisibility between the sample size $n$ and $k$ using an if-else statement depending on the module of $n/k$
+
+```{r}
+k_folds <- function(data, k = 5) {
+  
+  module <- nrow(data) %% k
+  floor <- nrow(data) %/% k 
+  
+  if (module == 0) {
+    trues <- matrix(1, nrow = floor, ncol = 1)
+    split_matrix <- kronecker(diag(k), trues)
+  } else {
+    trues_g1 <- matrix(1, nrow = floor + 1, ncol = 1)
+    split_matrix_g1 <- kronecker(diag(module), trues_g1)
+    
+    trues_g2 <- matrix(1, nrow = floor, ncol = 1)
+    split_matrix_g2 <- kronecker(diag(k - module), trues_g2)
+    
+    split_matrix <- rbind(
+      cbind(split_matrix_g1, matrix(0, nrow = nrow(split_matrix_g1), ncol = ncol(split_matrix_g2))),
+      cbind(matrix(0, nrow = nrow(split_matrix_g2), ncol = ncol(split_matrix_g1)), split_matrix_g2)
+    )
+  }
+  
+  sm_bool <- split_matrix == 1
+  splits <- lapply(1:k, function(x) sm_bool[, x])
+  
+  return(splits)
+}
+```
+
+### the `optimal_lambda` search function
+
+we basically adapted the code provided in the labs so it can use the functions of log-grid and our own $k$-folds function
+
+```{r}
+optimal_lambda <- function(Y, X, lambda_bounds, k = 5, niter = 100) {
+  
+  library(glmnet)
+  
+  Y <- drop(Y)
+  
+  if (is.vector(X)) {
+    X <- matrix(X, ncol = 1)
+  }
+  
+  folds <- k_folds(X, k)
+  all_lambdas <- exp(seq(lambda_bounds[1], lambda_bounds[2], length.out = niter))
+  all_mse <- numeric(niter)
+  
+  for (l in all_lambdas) {
+    split_pes <- numeric(k)
+    
+    for (i in seq_len(k)) {
+      X_train <- X[!folds[[i]], ]
+      X_test <- X[folds[[i]], ]
+      y_train <- Y[!folds[[i]]]
+      y_test <- Y[folds[[i]]]
+      
+      model <- glmnet(X_train, y_train, alpha = 1, lambda = l,standardize = FALSE)
+      predict <- predict(model, X_test, s = l)
+      
+      pe <- sum((y_test - predict)^2)
+      split_pes[i] <- pe
+    }
+    
+    all_mse[which(all_lambdas == l)] <- mean(split_pes)
+  }
+  
+  selected <- which.min(all_mse)
+  optimal_lambda <- all_lambdas[selected]
+  optimal_model <- glmnet(X, Y, alpha = 1, lambda = optimal_lambda)
+  optimal_coef <- coef(optimal_model, s = optimal_lambda)
+  
+  output <- list(
+    optimal_lambda = optimal_lambda,
+    optimal_coef = optimal_coef,
+    all_lambdas = all_lambdas,
+    all_mse = all_mse
+  )
+  
+  return(output)
+}
+```
+
+
+### The `predict_model`
+
+```{r}
+predict_model <- function(optimal_model, X) {
+  
+  intercept <- matrix(1, nrow = nrow(X), ncol = 1)
+  Z <- cbind(intercept, X)
+  
+  return(Z %*% optimal_model$optimal_coef)
+}
+```
+
+
+
+## Applying the Lasso Cross-Validation Procedure
+split the sample in train and test
+```{r}
+library(caTools)
+
+
+split <- sample.split(y, SplitRatio = 0.75)
+X_flexible_train <- subset(X_flexible, split == TRUE)
+X_flexible_test <- subset(X_flexible, split == FALSE)
+y_train <- y[split]
+y_test <- y[!split]
+```
+
+### Perform the OLS fitting
+
+```{r}
+model_ls <- lm(y_train ~ ., data = data.frame(y_train = y_train, X_flexible_train))
+```
+
+### The optimal lambda using our `optimal_lambda` function
+
+```{r}
+model_lasso <- optimal_lambda(y_train, X_flexible_train, c(-7, 7))
+print(model_lasso$optimal_lambda)
+```
+
+```{r}
+print(model_lasso$optimal_coef)
+```
+
+## HDM
+HDM for R (hdm) to estimate the model using the theoretically optimal penalty parameter
+
+check the [package documentation](https://arxiv.org/pdf/1608.00354)
+
+```{r}
+install.packages("hdm")
+library(hdm)
+
+model_rlasso <- rlasso(X_flexible_train, y_train)
+```
+
+
+```{r}
+rlambda = model_rlasso$lambda0
+rlambda
+```
+
+```{r}
+y_predict_ols <- predict(model_ls, data.frame(X_flexible_test))
+
+MSE_ols <- mean((y_test - y_predict_ols)^2)
+
+R2_test_ols <- 1 - MSE_ols / var(y_test)
+
+print(R2_test_ols)
+```
+
+### Lasso CV
+
+```{r}
+y_predict_lasso <- predict_model(model_lasso, X_flexible_test)
+MSE_lasso <- mean((y_test - y_predict_lasso)^2)
+R2_test_lasso <- 1 - MSE_lasso / var(y_test)
+
+print(R2_test_lasso)
+```
+
+### Rigurous Lasso
+
+```{r}
+y_predict_rlasso <- predict(model_rlasso, newdata = X_flexible_test)
+MSE_rlasso <- mean((y_test - y_predict_rlasso)^2)
+R2_test_rlasso <- 1 - MSE_rlasso / var(y_test)
+
+print(R2_test_rlasso)
+```
